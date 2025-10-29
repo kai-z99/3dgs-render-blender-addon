@@ -1,0 +1,157 @@
+# Blender 3.x+ — Render ONLY the six cubemap faces to disk
+# Keeps robust render/file settings and optional atomic moves.
+# Cross/equirect generation completely removed.
+
+import bpy
+import math
+import os
+from mathutils import Vector
+
+# =========================
+# ==== DEBUG CONTROLS  ====
+# =========================
+DEBUG = True                 # Master switch for prints
+PRINT_SAVE_CHECKS = True     # Print file size checks after save
+
+def dbg(msg):
+    if DEBUG:
+        print(f"[CMDBG] {msg}", flush=True)
+
+# =========================
+# ======   SETTINGS   =====
+# =========================
+RES = 1024                  # Target face size: 1024, 2048, 4096...
+OUTPUT_DIR = "//cubemap/"   # Relative to .blend
+FILE_FMT = 'PNG'            # 'PNG' (LDR), 'OPEN_EXR' (HDR), or 'HDR' (Radiance)
+VIEW_TRANSFORM = 'Standard' # 'Standard' (LDR) or 'Raw' (EXR/HDR workflows)
+ENGINE = 'CYCLES'           # 'CYCLES' or 'BLENDER_EEVEE'
+
+# Optional: render to temp dir then atomically move to final
+ATOMIC_MOVES = False
+
+# =========================
+# ======   CONSTANTS  =====
+# =========================
+EXT_MAP = {
+    'PNG': '.png',
+    'OPEN_EXR': '.exr',
+    'HDR': '.hdr',
+    'JPEG': '.jpg',
+    'TIFF': '.tif',
+    'TARGA': '.tga',
+    'TARGA_RAW': '.tga'
+}
+EXT = EXT_MAP.get(FILE_FMT, '.png')
+
+# Flags derived from format
+IS_HDRLIKE = FILE_FMT in {'OPEN_EXR', 'HDR'}  # scene-referred/high-dynamic-range workflow
+IS_EXR = FILE_FMT == 'OPEN_EXR'
+IS_RAD_HDR = FILE_FMT == 'HDR'
+COLORSPACE = 'Linear' if IS_HDRLIKE else 'sRGB'
+
+# Ensure output dirs exist
+abs_out = bpy.path.abspath(OUTPUT_DIR)
+os.makedirs(abs_out, exist_ok=True)
+
+# Optional temp staging dir for atomic moves
+tmp_dir = os.path.join(abs_out, "_tmp")
+if ATOMIC_MOVES:
+    os.makedirs(tmp_dir, exist_ok=True)
+
+dbg(f"START | RES={RES} ENGINE={ENGINE} FILE_FMT={FILE_FMT} VIEW={VIEW_TRANSFORM} OUT={abs_out}")
+dbg(f"HDRLIKE={IS_HDRLIKE} EXR={IS_EXR} RAD_HDR={IS_RAD_HDR} COLORSPACE={COLORSPACE} EXT={EXT}")
+
+# Ensure a camera exists, or create one at 3D cursor
+cam = None
+for obj in bpy.data.objects:
+    if obj.type == 'CAMERA':
+        cam = obj
+        break
+if cam is None:
+    cam_data = bpy.data.cameras.new("CubemapCam")
+    cam = bpy.data.objects.new("CubemapCam", cam_data)
+    bpy.context.collection.objects.link(cam)
+    dbg("Created camera: CubemapCam")
+
+# Move camera to 3D cursor + small Z offset
+cursor = bpy.context.scene.cursor.location
+cam.location = Vector((cursor.x, cursor.y, cursor.z + 2.0))
+cam.rotation_euler = (0.0, 0.0, 0.0)
+dbg(f"Camera at {tuple(cam.location)}")
+
+# Camera lens: 90° FOV for cube faces
+cam.data.lens_unit = 'FOV'
+cam.data.angle = math.radians(90.0)
+cam.data.clip_start = 0.01
+cam.data.clip_end = 10000.0
+
+# Scene/render setup
+scene = bpy.context.scene
+scene.camera = cam
+scene.render.engine = ENGINE
+scene.render.resolution_x = RES
+scene.render.resolution_y = RES
+scene.render.resolution_percentage = 100
+scene.render.image_settings.file_format = FILE_FMT
+
+# --- Minimal change: set color mode by format (Radiance HDR has no alpha) ---
+scene.render.image_settings.color_mode = 'RGB' if IS_RAD_HDR else 'RGBA'
+
+scene.view_settings.view_transform = VIEW_TRANSFORM
+scene.render.use_file_extension = True
+scene.render.use_overwrite = True                # don't auto-increment filenames
+scene.render.film_transparent = False
+
+# Optional HDR details
+if IS_EXR:
+    scene.render.image_settings.color_depth = '32'
+    scene.render.image_settings.exr_codec = 'ZIP'
+elif IS_RAD_HDR:
+    # Blender will accept 32 here; Radiance HDR stores HDR natively (no alpha).
+    scene.render.image_settings.color_depth = '32'
+
+dbg(f"Film Transparent={scene.render.film_transparent}")
+
+# Face definitions: (name, yaw_z_deg, pitch_x_deg)
+faces = [
+    ("right",   -90.0,  90.0),  # +X
+    ("left",     90.0,  90.0),  # -X
+    ("front",     0.0,  90.0),  # +Y
+    ("back",    180.0,  90.0),  # -Y
+    ("top",       0.0, 180.0),  # +Z
+    ("bottom",    0.0,   0.0),  # -Z
+]
+
+# Helper: set rotation in world-space via Euler XYZ (Blender uses Z-up)
+def set_rot(x_deg, y_deg, z_deg):
+    cam.rotation_euler[0] = math.radians(x_deg)  # X (pitch)
+    cam.rotation_euler[1] = math.radians(y_deg)  # Y (roll)
+    cam.rotation_euler[2] = math.radians(z_deg)  # Z (yaw)
+
+# --------------- Rendering 6 faces ----------------
+def render_face(name, yaw_z, pitch_x):
+    set_rot(pitch_x, 0.0, yaw_z)
+    if ATOMIC_MOVES:
+        tmp_base = os.path.join(tmp_dir, name)
+        scene.render.filepath = bpy.path.relpath(tmp_base)
+        bpy.ops.render.render(write_still=True)
+        src = os.path.join(tmp_dir, name + EXT)
+        dst = os.path.join(abs_out, name + EXT)
+        os.replace(src, dst)
+        return dst
+    else:
+        scene.render.filepath = OUTPUT_DIR + name  # Blender appends extension
+        bpy.ops.render.render(write_still=True)
+        return os.path.join(abs_out, name + EXT)
+
+for name, yaw_z, pitch_x in faces:
+    full = render_face(name, yaw_z, pitch_x)
+    try:
+        size = os.path.getsize(full)
+    except Exception:
+        size = -1
+    if PRINT_SAVE_CHECKS:
+        dbg(f"Rendered {name:<12} -> {bpy.path.abspath(full)} (bytes={size})")
+
+print("Cubemap faces rendered to:", abs_out)
+dbg("DONE.")
