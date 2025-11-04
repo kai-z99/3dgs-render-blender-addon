@@ -141,7 +141,8 @@ def render_face(name, yaw_z, pitch_x):
         return dst
     else:
         scene.render.filepath = OUTPUT_DIR + name  # Blender appends extension
-        bpy.ops.render.render(write_still=True)
+        #bpy.ops.render.render(write_still=True)
+        bpy.ops.sna.dgs_render_advanced_render_ba196()
         return os.path.join(abs_out, name + EXT)
 
 for name, yaw_z, pitch_x in faces:
