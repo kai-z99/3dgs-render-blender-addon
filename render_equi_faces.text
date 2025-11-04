@@ -1,5 +1,5 @@
 # Blender 3.x — Render ONLY vertical equirectangular strips to disk
-# Now auto-sizes strips so the final stitched pano is exactly 2:1 (width = 2 * HEIGHT).
+# Auto-sizes strips so the final stitched pano is exactly 2:1 (width = 2 * HEIGHT).
 # You choose NUM_STRIPS and HEIGHT; strip widths are computed so their sum is 2*HEIGHT.
 # Uses a Cycles panorama camera (Equirectangular) and either crops across X
 # or keeps a fixed crop and rotates around Z between strips (your choice).
@@ -34,7 +34,6 @@ OUTPUT_DIR     = "//eq_strips/"   # relative to .blend unless absolute path
 FILE_FMT       = 'PNG'            # 'PNG' (LDR), 'OPEN_EXR' (HDR), or 'HDR' (Radiance)
 VIEW_TRANSFORM = 'Standard'       # 'Standard' for LDR, 'Raw' for scene-linear workflows
 ENGINE         = 'CYCLES'         # Must be CYCLES for panoramic equirect
-ATOMIC_MOVES   = False            # Optional: render to temp and then atomic move
 
 # =========================
 # ======  CONSTANTS   =====
@@ -49,14 +48,9 @@ IS_EXR     = FILE_FMT == 'OPEN_EXR'
 IS_RAD_HDR = FILE_FMT == 'HDR'
 COLORSPACE = 'Linear' if IS_HDRLIKE else 'sRGB'
 
-# Ensure output dirs exist
+# Ensure output dir exists
 abs_out = bpy.path.abspath(OUTPUT_DIR)
 os.makedirs(abs_out, exist_ok=True)
-
-# Optional temp staging dir for atomic moves
-_tmp = os.path.join(abs_out, "_tmp")
-if ATOMIC_MOVES:
-    os.makedirs(_tmp, exist_ok=True)
 
 # Ensure a camera exists (re-use first camera or create one at 3D cursor)
 cam = None
@@ -70,15 +64,14 @@ if cam is None:
     bpy.context.collection.objects.link(cam)
     dbg("Created camera: EquirectCam")
 
-# Position camera at 3D cursor (raise slightly to avoid clipping in some scenes)
+# Position camera at 3D cursor
 cursor = bpy.context.scene.cursor.location
 cam.location = Vector((cursor.x, cursor.y, cursor.z + 0.0))
 cam.rotation_euler = (0.0, 0.0, 0.0)
 
 # Configure as panoramic equirectangular (Cycles only)
 cam.data.type = 'PANO'
-if hasattr(cam.data, 'cycles'):
-    cam.data.cycles.panorama_type = 'EQUIRECTANGULAR'
+cam.data.panorama_type = 'EQUIRECTANGULAR'
 
 # Scene/render setup
 scene = bpy.context.scene
@@ -93,7 +86,6 @@ scene.render.resolution_percentage = 100
 
 scene.render.image_settings.file_format = FILE_FMT
 scene.render.image_settings.color_mode = 'RGB' if IS_RAD_HDR else 'RGBA'
-# Guard: some Blender configs need view_settings access via display settings
 try:
     scene.view_settings.view_transform = VIEW_TRANSFORM
 except Exception:
@@ -114,7 +106,6 @@ elif IS_RAD_HDR:
     scene.render.image_settings.color_depth = '32'  # Radiance HDR is RGB-only
 
 # Helpers
-
 def set_yaw_deg(z_degrees: float):
     # Keep X/Y (pitch/roll) set for level horizon; yaw around Z
     cam.rotation_euler[0] = math.radians(90)
@@ -131,7 +122,6 @@ def set_border(min_x: float, max_x: float):
 def pixel_edges(total_w: int, n: int):
     """Return integer pixel edges [e0..en] that partition total_w into n strips
     whose widths differ by at most 1 px and sum exactly to total_w."""
-    # e_i = floor(i * total_w / n)
     edges = [(i * total_w) // n for i in range(n + 1)]
     return edges
 
@@ -161,17 +151,9 @@ for i in range(NUM_STRIPS):
         set_border(min_x, max_x)
 
     base_name = f"strip_{i:03d}"
-    if ATOMIC_MOVES:
-        scene.render.filepath = bpy.path.relpath(os.path.join(_tmp, base_name))
-        bpy.ops.render.render(write_still=True)
-        src = os.path.join(_tmp, base_name + EXT)
-        dst = os.path.join(abs_out, base_name + EXT)
-        os.replace(src, dst)
-        out_path = dst
-    else:
-        scene.render.filepath = OUTPUT_DIR + base_name
-        bpy.ops.render.render(write_still=True)
-        out_path = os.path.join(abs_out, base_name + EXT)
+    scene.render.filepath = OUTPUT_DIR + base_name
+    bpy.ops.render.render(write_still=True)
+    out_path = os.path.join(abs_out, base_name + EXT)
 
     size = -1
     try:
@@ -179,8 +161,7 @@ for i in range(NUM_STRIPS):
     except Exception:
         pass
     if PRINT_SAVE_CHECKS:
-        dbg(f"Rendered {base_name} -> {bpy.path.abspath(out_path)} "
-            f"(bytes={size})")
+        dbg(f"Rendered {base_name} -> {bpy.path.abspath(out_path)} (bytes={size})")
 
 print("Equirectangular strips written to:", abs_out)
 dbg("DONE.")
