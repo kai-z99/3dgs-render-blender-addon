@@ -1,10 +1,3 @@
-# Blender 3.x — Render ONLY vertical equirectangular strips to disk
-# Auto-sizes strips so the final stitched pano is exactly 2:1 (width = 2 * HEIGHT).
-# You choose NUM_STRIPS and HEIGHT; strip widths are computed so their sum is 2*HEIGHT.
-# Uses a Cycles panorama camera (Equirectangular) and either crops across X
-# or keeps a fixed crop and rotates around Z between strips (your choice).
-# Output: strip_000..strip_{N-1} written to OUTPUT_DIR at computed WIDTH_i x HEIGHT.
-
 import bpy
 import os
 import math
@@ -33,7 +26,7 @@ ROTATE_AROUND_Z = True         # If True: rotate Z per strip & render leftmost b
 OUTPUT_DIR     = "//eq_strips/"   # relative to .blend unless absolute path
 FILE_FMT       = 'PNG'            # 'PNG' (LDR), 'OPEN_EXR' (HDR), or 'HDR' (Radiance)
 VIEW_TRANSFORM = 'Standard'       # 'Standard' for LDR, 'Raw' for scene-linear workflows
-ENGINE         = 'CYCLES'         # Must be CYCLES for panoramic equirect
+ENGINE         = 'CYCLES'         # !!! Must be CYCLES for panoramic equirect !!!
 
 # =========================
 # ======  CONSTANTS   =====
@@ -52,30 +45,31 @@ COLORSPACE = 'Linear' if IS_HDRLIKE else 'sRGB'
 abs_out = bpy.path.abspath(OUTPUT_DIR)
 os.makedirs(abs_out, exist_ok=True)
 
-# Ensure a camera exists (re-use first camera or create one at 3D cursor)
-cam = None
-for obj in bpy.data.objects:
-    if obj.type == 'CAMERA':
-        cam = obj
-        break
+# Scene/render setup
+scene = bpy.context.scene
+
+# Ensure a camera exists (prefer the active scene camera), keep its CURRENT LOCATION
+cam = scene.camera if scene.camera and scene.camera.type == 'CAMERA' else None
+if cam is None:
+    for obj in bpy.data.objects:
+        if obj.type == 'CAMERA':
+            cam = obj
+            break
 if cam is None:
     cam_data = bpy.data.cameras.new("EquirectCam")
     cam = bpy.data.objects.new("EquirectCam", cam_data)
     bpy.context.collection.objects.link(cam)
     dbg("Created camera: EquirectCam")
+else:
+    dbg(f"Using existing camera at location: {tuple(cam.location)}")
 
-# Position camera at 3D cursor
-cursor = bpy.context.scene.cursor.location
-cam.location = Vector((cursor.x, cursor.y, cursor.z + 0.0))
-cam.rotation_euler = (0.0, 0.0, 0.0)
+# Do NOT move the camera; use its current location
+scene.camera = cam
 
 # Configure as panoramic equirectangular (Cycles only)
 cam.data.type = 'PANO'
 cam.data.panorama_type = 'EQUIRECTANGULAR'
 
-# Scene/render setup
-scene = bpy.context.scene
-scene.camera = cam
 scene.render.engine = ENGINE
 
 # Final pano must be exactly 2:1; set total width accordingly.
