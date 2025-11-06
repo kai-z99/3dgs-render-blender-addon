@@ -6,8 +6,9 @@ from mathutils import Vector
 # =========================
 # ==== DEBUG CONTROLS  ====
 # =========================
-DEBUG = True
+DEBUG = False
 PRINT_SAVE_CHECKS = True
+KEEP_STRIPS = DEBUG  # Delete strips after stitching unless debugging
 
 def dbg(msg):
     if DEBUG:
@@ -17,8 +18,8 @@ def dbg(msg):
 # ======   SETTINGS   =====
 # =========================
 # Geometry / tiling
-NUM_STRIPS      = 4            # 1 = full 360 in one shot; N strips each 360/N degrees
-HEIGHT          = 2048         # pixel height of each strip (equirect full vertical FOV)
+NUM_STRIPS      = 8            # 1 = full 360 in one shot; N strips each 360/N degrees
+HEIGHT          = 1024         # pixel height of each strip (equirect full vertical FOV)
 
 # I/O and render format
 OUTPUT_DIR     = "//eq_strips/"   # relative to .blend unless absolute path
@@ -38,6 +39,7 @@ IS_HDRLIKE = FILE_FMT in {'OPEN_EXR','HDR'}
 IS_EXR     = FILE_FMT == 'OPEN_EXR'
 IS_RAD_HDR = FILE_FMT == 'HDR'
 COLORSPACE = 'Linear' if IS_HDRLIKE else 'sRGB'
+
 
 # Ensure output dir exists
 abs_out = bpy.path.abspath(OUTPUT_DIR)
@@ -126,6 +128,21 @@ edges_px = pixel_edges(BASE_W, NUM_STRIPS)
 widths_px = [edges_px[i+1] - edges_px[i] for i in range(NUM_STRIPS)]
 dbg(f"Per-strip widths (px): {widths_px} (sum={sum(widths_px)})")
 
+# --- Pre-run cleanup: remove any leftover strips from previous runs ---
+import glob as _glob
+_prev_patterns = [os.path.join(abs_out, f"strip_*{ext}") for ext in [".png", ".jpg", ".jpeg", ".tif", ".tiff", ".tga", ".hdr", ".exr"]]
+_prev_deleted = 0
+for _pat in _glob.glob(os.path.join(abs_out, "strip_*")):
+    # Broad match to catch all extensions, then filter by known ones
+    if any(_pat.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".tif", ".tiff", ".tga", ".hdr", ".exr"]):
+        try:
+            os.remove(_pat)
+            _prev_deleted += 1
+        except Exception as e:
+            dbg(f"Could not delete old strip {_pat}: {e}")
+if _prev_deleted:
+    dbg(f"Pre-clean: removed {_prev_deleted} old strip file(s).")
+
 # Render N strips
 for i in range(NUM_STRIPS):
     # Rotate Z by i * 360/N; render the leftmost band with exact pixel width
@@ -138,6 +155,7 @@ for i in range(NUM_STRIPS):
     base_name = f"strip_{i:03d}"
     scene.render.filepath = OUTPUT_DIR + base_name
     bpy.ops.render.render(write_still=True)
+    #bpy.ops.sna.dgs_render_advanced_render_ba196()
     out_path = os.path.join(abs_out, base_name + EXT)
 
     size = -1
@@ -162,50 +180,74 @@ dbg("DONE.")
 import sys
 import subprocess
 import tempfile
-import importlib
+import importlib.util
 
-# --- Auto-install dependencies for the stitcher (without changing its logic) ---
-# Tries normal pip install; if that fails (e.g., no write perms in Program Files),
-# falls back to --target in the output folder and adds it to sys.path.
+# --- Dependency handling (simple & reliable) ---
 
-def _ensure_pkg(import_name: str, pip_name: str | None = None) -> bool:
-    name = pip_name or import_name
-    try:
-        importlib.import_module(import_name)
-        print(f"[EQSTRIP] {import_name} already available")
-        return True
-    except Exception:
-        pass
-    try:
-        subprocess.run([sys.executable, '-m', 'ensurepip', '--upgrade'], check=False)
-        subprocess.run([sys.executable, '-m', 'pip', 'install', '--upgrade', 'pip', 'setuptools', 'wheel'], check=False)
-        # First try a regular install
-        r = subprocess.run([sys.executable, '-m', 'pip', 'install', name], check=False)
-        try:
-            importlib.import_module(import_name)
-            print(f"[EQSTRIP] Installed {name}")
-            return True
-        except Exception:
-            pass
-        # Fallback: install to a local target inside the output folder
-        target_dir = os.path.join(abs_out, '_pydeps')
-        os.makedirs(target_dir, exist_ok=True)
-        subprocess.run([sys.executable, '-m', 'pip', 'install', name, '--target', target_dir], check=False)
-        if target_dir not in sys.path:
-            sys.path.insert(0, target_dir)
-        importlib.invalidate_caches()
-        importlib.import_module(import_name)
-        print(f"[EQSTRIP] Installed {name} to {target_dir}")
-        return True
-    except Exception as e:
-        print(f"[EQSTRIP] Could not install {name}: {e}")
-        return False
+def _has_module(mod):
+    return importlib.util.find_spec(mod) is not None
 
-# Ensure the packages based on render format
-# (PNG/JPG/TIFF/TGA need Pillow; EXR/HDR need imageio). Installing both is fine
-_ensure_pkg('PIL', 'Pillow')
-_ensure_pkg('imageio')
 
+def _ensure_packages(pkgs, target_dir):
+    """
+    Ensure each (import_name, pip_name_or_None) is importable.
+    Try: user install -> target install (target_dir) and expose it to parent + child.
+    Returns an env dict to pass to subprocess.run(..., env=env).
+    """
+    env = os.environ.copy()
+
+    # Determine which are missing
+    need = []
+    for imp, pipname in pkgs:
+        name = pipname or imp
+        if not _has_module(imp):
+            need.append((imp, name))
+
+    if not need:
+        return env  # everything already available
+
+    # Make sure pip exists; keep this non-fatal
+    subprocess.run([sys.executable, "-m", "ensurepip", "--upgrade"], check=False)
+    subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"], check=False)
+
+    # 1) Try user site (no admin required)
+    for imp, name in need:
+        subprocess.run([sys.executable, "-m", "pip", "install", "--user", name], check=False)
+
+    # Re-check which still missing
+    still = []
+    for imp, name in need:
+        if not _has_module(imp):
+            still.append((imp, name))
+
+    if not still:
+        return env
+
+    # 2) Fallback to project-local target
+    os.makedirs(target_dir, exist_ok=True)
+    for imp, name in still:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--no-warn-script-location", "--target", target_dir, name],
+            check=False
+        )
+
+    # Make sure the parent can import from target_dir now
+    if target_dir not in sys.path:
+        sys.path.insert(0, target_dir)
+
+    # Ensure the child process (stitcher) can also see target_dir
+    env["PYTHONPATH"] = target_dir + (os.pathsep + env.get("PYTHONPATH", "") if env.get("PYTHONPATH") else "")
+    return env
+
+# Ensure the packages based on render format (keeping your functionality)
+pydeps_dir = os.path.join(abs_out, "_pydeps")
+child_env = _ensure_packages([
+    ("PIL", "Pillow"),     # for PNG/JPG/TIFF/TGA
+    ("imageio", "imageio") # for HDR/EXR
+], pydeps_dir)
+
+#Gonna run this on its own because originally this was a seperate python file and the behavior might change if we try to directly translate in blender.
+#But we should change this later.
 STITCHER_CODE = r'''#!/usr/bin/env python3
 import os, re, sys, argparse
 import numpy as np
@@ -359,7 +401,7 @@ if __name__ == "__main__":
     main()
 '''
 
-# Write the stitcher to a temp file (in the output folder for convenience)
+# Write the stitcher to a temp file
 with tempfile.NamedTemporaryFile('w', delete=False, suffix='_stitch_eq_strips.py', dir=abs_out) as tf:
     tf.write(STITCHER_CODE)
     stitcher_path = tf.name
@@ -369,10 +411,31 @@ cmd = [sys.executable, stitcher_path, '--folder', abs_out, '--prefix', 'strip_',
 print('[EQSTRIP] Running stitcher:', ' '.join(cmd))
 try:
     # Let the stitcher print its own progress/errors; do not alter its logic
-    subprocess.run(cmd, check=False)
+    result = subprocess.run(cmd, check=False, env=child_env)
 finally:
     # Optional cleanup: comment out the next line if you want to keep the temp stitcher file
     try:
         os.remove(stitcher_path)
     except Exception:
         pass
+
+# --- Post-stitch cleanup of intermediate strips ---
+rc = result.returncode if 'result' in locals() else -1
+if rc == 0 and not KEEP_STRIPS:
+    import glob
+    patterns = [os.path.join(abs_out, f"strip_*{ext}") for ext in [".png", ".jpg", ".jpeg", ".tif", ".tiff", ".tga", ".hdr", ".exr"]]
+    deleted = 0
+    for pat in patterns:
+        for p in glob.glob(pat):
+            try:
+                os.remove(p)
+                deleted += 1
+                dbg(f"Deleted strip: {os.path.basename(p)}")
+            except Exception as e:
+                dbg(f"Could not delete {p}: {e}")
+    dbg(f"Cleanup complete. Removed {deleted} strip file(s).")
+else:
+    if rc != 0:
+        dbg("Stitcher failed; keeping strips for debugging.")
+    elif KEEP_STRIPS:
+        dbg("KEEP_STRIPS is True; keeping intermediate strips.")
