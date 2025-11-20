@@ -33,6 +33,15 @@ CROSS_POS = {
     "bottom": (1, 2),
 }
 
+# ---------------------------------------------------------------------------
+# Seam / edge-blur tuning for the EQUIRECTANGULAR output
+# ---------------------------------------------------------------------------
+# Set EDGE_BLEND_ENABLE = False to go back to the original, no-blur behaviour.
+EDGE_BLEND_ENABLE   = True   # master on/off
+EDGE_BLEND_STRENGTH = 0.5    # 0..1, how strongly to cross-fade near edges
+EDGE_BLEND_START    = 0.97   # start blending when second axis / major axis >= this
+EDGE_BLEND_END      = 1   # treat as "fully at edge" when ratio >= this
+
 
 # ---------- file discovery (supports prefixes like right0001_color.png) ----------
 
@@ -147,7 +156,7 @@ def write_image(path: str, arr):
     Image.fromarray(a).save(path)
 
 
-# ---------- equirect from cross (unchanged) ----------
+# ---------- cube-face helpers ----------
 
 def _face_from_dir(x, y, z):
     ax, ay, az = np.abs(x), np.abs(y), np.abs(z)
@@ -164,6 +173,35 @@ def _face_from_dir(x, y, z):
     m = is_z & (z <= 0); face[m] = 3; denom[m] = az[m]  # -Z back
     m = is_y & (y > 0); face[m] = 4; denom[m] = ay[m]   # +Y top
     m = is_y & (y <= 0); face[m] = 5; denom[m] = ay[m]  # -Y bottom
+    return face, denom
+
+def _faces_from_axis_choice(axis_idx, x, y, z, ax, ay, az):
+    """
+    Map a chosen major axis (0=X,1=Y,2=Z) plus sign to a cubemap face index
+    and the corresponding denom = max(|axis|).
+    Used for seam blending where we also sample from the second-strongest axis.
+    """
+    face = np.empty_like(axis_idx, dtype=np.int32)
+    denom = np.empty_like(axis_idx, dtype=x.dtype)
+
+    # X axis -> right / left
+    m = axis_idx == 0
+    mp = m & (x > 0); mn = m & (x <= 0)
+    face[mp] = 0; denom[mp] = ax[mp]
+    face[mn] = 1; denom[mn] = ax[mn]
+
+    # Y axis -> top / bottom
+    m = axis_idx == 1
+    mp = m & (y > 0); mn = m & (y <= 0)
+    face[mp] = 4; denom[mp] = ay[mp]
+    face[mn] = 5; denom[mn] = ay[mn]
+
+    # Z axis -> front / back
+    m = axis_idx == 2
+    mp = m & (z > 0); mn = m & (z <= 0)
+    face[mp] = 2; denom[mp] = az[mp]
+    face[mn] = 3; denom[mn] = az[mn]
+
     return face, denom
 
 def _uv_on_face(face, x, y, z, denom):
@@ -216,7 +254,9 @@ def _tile_offsets_for_faces(face, F):
 def _bilinear_sample(img, xf, yf):
     H, W = img.shape[:2]
     x0 = np.floor(xf).astype(np.int32); y0 = np.floor(yf).astype(np.int32)
-    x1 = np.clip(x0 + 1, 0, W - 1);     y1 = np.clip(y0 + 1, 0, H - 1)
+    # Clamp the base index as well to keep it in-bounds
+    x0 = np.clip(x0, 0, W - 1);        y0 = np.clip(y0, 0, H - 1)
+    x1 = np.clip(x0 + 1, 0, W - 1);    y1 = np.clip(y0 + 1, 0, H - 1)
     wx = xf - x0; wy = yf - y0
     Ia = img[y0, x0]; Ib = img[y0, x1]; Ic = img[y1, x0]; Id = img[y1, x1]
     wa = (1 - wx) * (1 - wy); wb = wx * (1 - wy); wc = (1 - wx) * wy; wd = wx * wy
@@ -224,11 +264,86 @@ def _bilinear_sample(img, xf, yf):
         wa = wa[..., None]; wb = wb[..., None]; wc = wc[..., None]; wd = wd[..., None]
     return Ia * wa + Ib * wb + Ic * wc + Id * wd
 
+
+# ---------- equirect from cross ----------
+
+def _equirect_from_cross_blended(cross_f, F, eq_w, eq_h):
+    """
+    Seam-blended sampling for the equirect output. We pick the major cube face
+    for each direction, and softly cross-fade with the second-closest face
+    near edges to hide visible seams from imperfect cubemaps.
+    """
+    # Build lon/lat grid (pixel centers)
+    jj = (np.arange(eq_w, dtype=np.float64) + 0.5) / eq_w
+    ii = (np.arange(eq_h, dtype=np.float64) + 0.5) / eq_h
+    uu, vv = np.meshgrid(jj, ii)
+
+    lon = (uu * 2.0 * math.pi) - math.pi       # [-pi, pi], 0 faces +Z (front)
+    lat = (0.5 - vv) * math.pi                 # [-pi/2, pi/2], + up
+
+    cos_lat = np.cos(lat)
+    x = cos_lat * np.sin(lon)
+    y = np.sin(lat)
+    z = cos_lat * np.cos(lon)
+
+    # Magnitudes for each axis
+    ax, ay, az = np.abs(x), np.abs(y), np.abs(z)
+    axes = np.stack([ax, ay, az], axis=-1)   # (..., 3)
+
+    # Find the strongest and second-strongest axes
+    idx_sorted = np.argsort(axes, axis=-1)   # ascending
+    major_axis = idx_sorted[..., 2]
+    second_axis = idx_sorted[..., 1]
+
+    # Primary and secondary faces + their denoms
+    faces0, denom0 = _faces_from_axis_choice(major_axis, x, y, z, ax, ay, az)
+    faces1, denom1 = _faces_from_axis_choice(second_axis, x, y, z, ax, ay, az)
+
+    # (u,v) on each face, clamp to [-1,1] just in case
+    u0, v0 = _uv_on_face(faces0, x, y, z, denom0)
+    u1, v1 = _uv_on_face(faces1, x, y, z, denom1)
+    u0 = np.clip(u0, -1.0, 1.0); v0 = np.clip(v0, -1.0, 1.0)
+    u1 = np.clip(u1, -1.0, 1.0); v1 = np.clip(v1, -1.0, 1.0)
+
+    # Map [-1,1] -> pixel coords inside each face
+    fx0 = (u0 + 1.0) * 0.5 * (F - 1)
+    fy0 = (1.0 - (v0 + 1.0) * 0.5) * (F - 1)
+    fx1 = (u1 + 1.0) * 0.5 * (F - 1)
+    fy1 = (1.0 - (v1 + 1.0) * 0.5) * (F - 1)
+
+    # Add tile offsets for each face
+    offx0, offy0 = _tile_offsets_for_faces(faces0, F)
+    offx1, offy1 = _tile_offsets_for_faces(faces1, F)
+    sx0 = offx0.astype(np.float64) + fx0
+    sy0 = offy0.astype(np.float64) + fy0
+    sx1 = offx1.astype(np.float64) + fx1
+    sy1 = offy1.astype(np.float64) + fy1
+
+    # Sample both faces
+    c0 = _bilinear_sample(cross_f, sx0, sy0)
+    c1 = _bilinear_sample(cross_f, sx1, sy1)
+
+    # How close are we to an edge?  a1/a0 is near 1.0 on seams, near 0 in the center.
+    a0 = np.take_along_axis(axes, major_axis[..., None], axis=-1)[..., 0]
+    a1 = np.take_along_axis(axes, second_axis[..., None], axis=-1)[..., 0]
+    ratio = a1 / (a0 + 1e-6)
+
+    # Turn ratio into a blend weight in [0,1]
+    t = (ratio - EDGE_BLEND_START) / max(1e-6, (EDGE_BLEND_END - EDGE_BLEND_START))
+    t = np.clip(t, 0.0, 1.0) * EDGE_BLEND_STRENGTH
+    if c0.ndim == 3:
+        t = t[..., None]
+
+    return c0 * (1.0 - t) + c1 * t
+
 def equirect_from_cross(cross_img, eq_w=None, eq_h=None):
     """
     Generate an equirectangular panorama from a horizontal-cross cubemap image.
     The cross must be 4*F by 3*F where F is face size.
     If eq_w/eq_h are None, uses eq_w=4F, eq_h=2F.
+
+    If EDGE_BLEND_ENABLE is True, we do a soft cross-fade between cube faces
+    near the seams to hide cubemap discontinuities.
     """
     H, W = cross_img.shape[:2]
     F = min(W // 4, H // 3)
@@ -238,19 +353,22 @@ def equirect_from_cross(cross_img, eq_w=None, eq_h=None):
     if eq_w is None: eq_w = 4 * F
     if eq_h is None: eq_h = 2 * F
 
-    # --- Normalize source for sampling ---
+    # Normalize source for sampling: uint8 -> float in 0..1
     if np.issubdtype(cross_img.dtype, np.integer):
         cross_f = cross_img.astype(np.float32) / 255.0
     else:
         cross_f = cross_img.astype(np.float32)
 
-    # Build lon/lat grid (pixel centers)
+    if EDGE_BLEND_ENABLE:
+        return _equirect_from_cross_blended(cross_f, F, eq_w, eq_h)
+
+    # --- Original single-face sampling path (no seam blur) ---
     jj = (np.arange(eq_w, dtype=np.float64) + 0.5) / eq_w
     ii = (np.arange(eq_h, dtype=np.float64) + 0.5) / eq_h
     uu, vv = np.meshgrid(jj, ii)
 
-    lon = (uu * 2.0 * math.pi) - math.pi       # [-pi, pi], 0 faces +Z (front)
-    lat = (0.5 - vv) * math.pi                 # [-pi/2, pi/2], + up
+    lon = (uu * 2.0 * math.pi) - math.pi       # [-pi, pi]
+    lat = (0.5 - vv) * math.pi                 # [-pi/2, pi/2]
 
     cos_lat = np.cos(lat)
     x = cos_lat * np.sin(lon)
@@ -267,9 +385,7 @@ def equirect_from_cross(cross_img, eq_w=None, eq_h=None):
     sx = offx.astype(np.float64) + fx
     sy = offy.astype(np.float64) + fy
 
-    # Bilinear sample from normalized cross
-    out = _bilinear_sample(cross_f, sx, sy)
-    return out
+    return _bilinear_sample(cross_f, sx, sy)
 
 
 # ---------- main ----------
