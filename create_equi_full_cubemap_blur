@@ -1,0 +1,696 @@
+# Blender 3.x+ — Render ONLY the six cubemap faces to disk
+# Keeps robust render/file settings and optional atomic moves.
+# Now also embeds and runs make_cross_cubemap.py as a subprocess with no behavior changes.
+
+import bpy
+import math
+import os
+import sys
+import subprocess
+import tempfile    
+from mathutils import Vector
+
+# =========================
+# ==== DEBUG CONTROLS  ====
+# =========================
+DEBUG = True                 # Master switch for prints
+PRINT_SAVE_CHECKS = True     # Print file size checks after save
+
+def dbg(msg):
+    if DEBUG:
+        print(f"[CMDBG] {msg}", flush=True)
+
+# =========================
+# ======   SETTINGS   =====
+# =========================
+RES = 1024                  # Target face size: 1024, 2048, 4096...
+OUTPUT_DIR = "//cubemap/"   # Relative to .blend
+FILE_FMT = 'PNG'            # 'PNG' (LDR), 'OPEN_EXR' (HDR), or 'HDR' (Radiance)
+VIEW_TRANSFORM = 'Standard' # 'Standard' (LDR) or 'Raw' (EXR/HDR workflows)
+ENGINE = 'CYCLES'           # 'CYCLES' or 'BLENDER_EEVEE'
+
+# Optional: render to temp dir then atomically move to final
+ATOMIC_MOVES = False
+
+# Control whether we run the embedded stitcher afterwards
+RUN_STITCHER = True
+STITCHER_SCRIPT_NAME = "make_cross_cubemap.py"
+
+# If you want to force a specific Python (e.g. system Python with numpy/Pillow/imageio),
+# set this to a full path string, e.g. r"C:\Python311\python.exe".
+PYTHON_EXE_OVERRIDE = None
+
+# =========================
+# ======   CONSTANTS  =====
+# =========================
+EXT_MAP = {
+    'PNG': '.png',
+    'OPEN_EXR': '.exr',
+    'HDR': '.hdr',
+    'JPEG': '.jpg',
+    'TIFF': '.tif',
+    'TARGA': '.tga',
+    'TARGA_RAW': '.tga'
+}
+EXT = EXT_MAP.get(FILE_FMT, '.png')
+
+# Flags derived from format
+IS_HDRLIKE = FILE_FMT in {'OPEN_EXR', 'HDR'}  # scene-referred/high-dynamic-range workflow
+IS_EXR = FILE_FMT == 'OPEN_EXR'
+IS_RAD_HDR = FILE_FMT == 'HDR'
+COLORSPACE = 'Linear' if IS_HDRLIKE else 'sRGB'
+
+# Ensure output dirs exist
+abs_out = bpy.path.abspath(OUTPUT_DIR)
+os.makedirs(abs_out, exist_ok=True)
+
+# Optional temp staging dir for atomic moves
+tmp_dir = os.path.join(abs_out, "_tmp")
+if ATOMIC_MOVES:
+    os.makedirs(tmp_dir, exist_ok=True)
+
+dbg(f"START | RES={RES} ENGINE={ENGINE} FILE_FMT={FILE_FMT} VIEW={VIEW_TRANSFORM} OUT={abs_out}")
+dbg(f"HDRLIKE={IS_HDRLIKE} EXR={IS_EXR} RAD_HDR={IS_RAD_HDR} COLORSPACE={COLORSPACE} EXT={EXT}")
+
+# Ensure a camera exists, or create one
+created_cam = False
+cam = None
+for obj in bpy.data.objects:
+    if obj.type == 'CAMERA':
+        cam = obj
+        break
+if cam is None:
+    cam_data = bpy.data.cameras.new("CubemapCam")
+    cam = bpy.data.objects.new("CubemapCam", cam_data)
+    bpy.context.collection.objects.link(cam)
+    created_cam = True
+    dbg("Created camera: CubemapCam")
+
+# If we created the camera, place it at the 3D cursor.
+# If we found an existing camera, KEEP its current position.
+if created_cam:
+    cursor = bpy.context.scene.cursor.location
+    cam.location = Vector((cursor.x, cursor.y, cursor.z + 2.0))
+    dbg(f"New camera at {tuple(cam.location)}")
+else:
+    dbg(f"Using existing camera position at {tuple(cam.location)}")
+
+# Camera lens: 90° FOV for cube faces
+cam.data.lens_unit = 'FOV'
+cam.data.angle = math.radians(90.0)
+cam.data.clip_start = 0.01
+cam.data.clip_end = 10000.0
+
+# Scene/render setup
+scene = bpy.context.scene
+scene.camera = cam
+scene.render.engine = ENGINE
+scene.render.resolution_x = RES
+scene.render.resolution_y = RES
+scene.render.resolution_percentage = 100
+scene.render.image_settings.file_format = FILE_FMT
+
+# --- Minimal change: set color mode by format (Radiance HDR has no alpha) ---
+scene.render.image_settings.color_mode = 'RGB' if IS_RAD_HDR else 'RGBA'
+
+scene.view_settings.view_transform = VIEW_TRANSFORM
+scene.render.use_file_extension = True
+scene.render.use_overwrite = True                # don't auto-increment filenames
+scene.render.film_transparent = False
+
+# Optional HDR details
+if IS_EXR:
+    scene.render.image_settings.color_depth = '32'
+    scene.render.image_settings.exr_codec = 'ZIP'
+elif IS_RAD_HDR:
+    # Blender will accept 32 here; Radiance HDR stores HDR natively (no alpha).
+    scene.render.image_settings.color_depth = '32'
+
+dbg(f"Film Transparent={scene.render.film_transparent}")
+
+# Face definitions: (name, yaw_z_deg, pitch_x_deg)
+faces = [
+    ("right",   -90.0,  90.0),  # +X
+    ("left",     90.0,  90.0),  # -X
+    ("front",     0.0,  90.0),  # +Y
+    ("back",    180.0,  90.0),  # -Y
+    ("top",       0.0, 180.0),  # +Z
+    ("bottom",    0.0,   0.0),  # -Z
+]
+
+# Helper: set rotation in world-space via Euler XYZ (Blender uses Z-up)
+def set_rot(x_deg, y_deg, z_deg):
+    cam.rotation_euler[0] = math.radians(x_deg)  # X (pitch)
+    cam.rotation_euler[1] = math.radians(y_deg)  # Y (roll)
+    cam.rotation_euler[2] = math.radians(z_deg)  # Z (yaw)
+
+# --------------- Rendering 6 faces ----------------
+def render_face(name, yaw_z, pitch_x):
+    set_rot(pitch_x, 0.0, yaw_z)
+    if ATOMIC_MOVES:
+        tmp_base = os.path.join(tmp_dir, name)
+        scene.render.filepath = bpy.path.relpath(tmp_base)
+        # bpy.ops.render.render(write_still=True)
+        bpy.ops.sna.dgs_render_advanced_render_ba196()
+        src = os.path.join(tmp_dir, name + EXT)
+        dst = os.path.join(abs_out, name + EXT)
+        os.replace(src, dst)
+        return dst
+    else:
+        scene.render.filepath = OUTPUT_DIR + name  # Blender appends extension
+        # bpy.ops.render.render(write_still=True)
+        bpy.ops.sna.dgs_render_advanced_render_ba196()
+        return os.path.join(abs_out, name + EXT)
+
+for name, yaw_z, pitch_x in faces:
+    full = render_face(name, yaw_z, pitch_x)
+    try:
+        size = os.path.getsize(full)
+    except Exception:
+        size = -1
+    if PRINT_SAVE_CHECKS:
+        dbg(f"Rendered {name:<12} -> {bpy.path.abspath(full)} (bytes={size})")
+
+print("Cubemap faces rendered to:", abs_out)
+dbg("Rendering DONE.")
+
+# =========================
+# === EMBEDDED STITCHER ===
+# =========================
+
+STITCHER_SOURCE = r'''#!/usr/bin/env python3
+"""
+make_cross_cubemap.py
+
+Build a horizontal-cross OpenGL cubemap from six images and ALSO create an
+equirectangular (lat-long) panorama from the generated cross image.
+
+Default (no args) writes both:
+  - cubemap_cross.<ext>
+  - equirect.<ext>
+"""
+import os, sys, argparse, math
+import numpy as np
+
+# Try imageio for HDR/EXR; Pillow for the rest
+try:
+    import imageio.v3 as iio
+except Exception:
+    iio = None
+try:
+    from PIL import Image
+except Exception:
+    Image = None
+
+SUPPORTED_EXTS = [".png", ".jpg", ".jpeg", ".tif", ".tiff", ".tga", ".hdr", ".exr"]
+FACE_BASENAMES = ["right", "left", "front", "back", "top", "bottom"]
+CROSS_POS = {
+    "top":    (1, 0),
+    "left":   (0, 1),
+    "front":  (1, 1),
+    "right":  (2, 1),
+    "back":   (3, 1),
+    "bottom": (1, 2),
+}
+
+# ---------------------------------------------------------------------------
+# Seam / edge-blur tuning for the EQUIRECTANGULAR output
+# ---------------------------------------------------------------------------
+# Set EDGE_BLEND_ENABLE = False to go back to the original, no-blur behaviour.
+EDGE_BLEND_ENABLE   = True   # master on/off
+EDGE_BLEND_STRENGTH = 0.5    # 0..1, how strongly to cross-fade near edges
+EDGE_BLEND_START    = 0.97   # start blending when second axis / major axis >= this
+EDGE_BLEND_END      = 1   # treat as "fully at edge" when ratio >= this
+
+
+# ---------- file discovery (supports prefixes like right0001_color.png) ----------
+
+def find_face_files(folder: str):
+    """
+    Find one file for each cubemap face in `folder`, where the filename
+    (without path) starts with the face name (right/left/front/back/top/bottom),
+    case-insensitive, and uses a supported extension.
+
+    Returns:
+        face_files: dict[face] = filename (basename only)
+        common_ext: extension string like ".png"
+
+    Raises:
+        FileNotFoundError if any face is missing or faces don't share an ext.
+    """
+    all_files = [f for f in os.listdir(folder)
+                 if os.path.isfile(os.path.join(folder, f))]
+    if not all_files:
+        raise FileNotFoundError(f"No files found in folder: {folder}")
+
+    face_files = {}
+    exts = set()
+
+    for face in FACE_BASENAMES:
+        prefix = face.lower()
+        candidates = []
+        for fname in all_files:
+            low = fname.lower()
+            base, ext = os.path.splitext(low)
+            if not ext or ext not in SUPPORTED_EXTS:
+                continue
+            if base.startswith(prefix):
+                candidates.append(fname)
+
+        if not candidates:
+            raise FileNotFoundError(
+                f"Could not find any file starting with '{face}' "
+                f"and with a supported extension in {folder}"
+            )
+
+        # Pick a deterministic candidate (shortest name, then lexicographically)
+        candidates.sort(key=lambda s: (len(s), s.lower()))
+        chosen = candidates[0]
+        face_files[face] = chosen
+        exts.add(os.path.splitext(chosen)[1].lower())
+
+    if len(exts) != 1:
+        raise FileNotFoundError(
+            "All six faces must share a single extension. Found: "
+            + ", ".join(sorted(exts))
+        )
+
+    common_ext = next(iter(exts))
+    return face_files, common_ext
+
+
+def read_image(path: str):
+    ext = os.path.splitext(path)[1].lower()
+    if ext in [".hdr", ".exr"]:
+        if iio is None:
+            raise RuntimeError(f"Reading {ext} requires `imageio`.")
+        arr = iio.imread(path)
+        if arr.ndim == 2:
+            arr = np.stack([arr, arr, arr], axis=-1)
+        return arr
+    else:
+        if Image is None:
+            raise RuntimeError("Reading non-HDR formats requires Pillow.")
+        with Image.open(path) as im:
+            return np_from_pillow(im)
+
+def np_from_pillow(im):
+    if im.mode not in ("RGB", "RGBA"):
+        im = im.convert("RGBA" if "A" in im.getbands() else "RGB")
+    return np.array(im)
+
+def write_image(path: str, arr):
+    ext = os.path.splitext(path)[1].lower()
+
+    # If writing Radiance HDR, drop alpha if present (HDR is RGB)
+    if ext == ".hdr" and arr.ndim == 3 and arr.shape[-1] == 4:
+        arr = arr[..., :3]
+
+    # HDR/EXR via imageio (write floats as-is)
+    if ext in [".hdr", ".exr"]:
+        if iio is None:
+            raise RuntimeError("Writing HDR/EXR requires `imageio` (pip install imageio).")
+        iio.imwrite(path, arr.astype(np.float32))
+        return
+
+    # LDR via Pillow
+    if Image is None:
+        raise RuntimeError("Writing PNG/JPG/TIFF/TGA requires Pillow. `pip install Pillow`.")
+
+    a = arr
+    if a.ndim == 2:
+        a = np.stack([a, a, a], axis=-1)
+
+    if a.dtype.kind == "f":
+        # If floats look like 0..255, bring them to uint8 directly.
+        maxv = float(np.nanmax(a)) if a.size else 0.0
+        minv = float(np.nanmin(a)) if a.size else 0.0
+        if maxv > 1.5 or minv < -0.5:
+            a = np.clip(a, 0.0, 255.0).astype("uint8")
+        else:
+            a = np.clip(a, 0.0, 1.0)
+            a = (a * 255.0 + 0.5).astype("uint8")
+    elif a.dtype != np.uint8:
+        a = np.clip(a, 0, 255).astype("uint8")
+
+    Image.fromarray(a).save(path)
+
+
+# ---------- cube-face helpers ----------
+
+def _face_from_dir(x, y, z):
+    ax, ay, az = np.abs(x), np.abs(y), np.abs(z)
+    is_x = (ax >= ay) & (ax >= az)
+    is_y = (ay >  ax) & (ay >= az)
+    is_z = ~(is_x | is_y)
+
+    face = np.empty_like(x, dtype=np.int32)
+    denom = np.empty_like(x, dtype=x.dtype)
+
+    m = is_x & (x > 0); face[m] = 0; denom[m] = ax[m]   # +X right
+    m = is_x & (x <= 0); face[m] = 1; denom[m] = ax[m]  # -X left
+    m = is_z & (z > 0); face[m] = 2; denom[m] = az[m]   # +Z front
+    m = is_z & (z <= 0); face[m] = 3; denom[m] = az[m]  # -Z back
+    m = is_y & (y > 0); face[m] = 4; denom[m] = ay[m]   # +Y top
+    m = is_y & (y <= 0); face[m] = 5; denom[m] = ay[m]  # -Y bottom
+    return face, denom
+
+def _faces_from_axis_choice(axis_idx, x, y, z, ax, ay, az):
+    """
+    Map a chosen major axis (0=X,1=Y,2=Z) plus sign to a cubemap face index
+    and the corresponding denom = max(|axis|).
+    Used for seam blending where we also sample from the second-strongest axis.
+    """
+    face = np.empty_like(axis_idx, dtype=np.int32)
+    denom = np.empty_like(axis_idx, dtype=x.dtype)
+
+    # X axis -> right / left
+    m = axis_idx == 0
+    mp = m & (x > 0); mn = m & (x <= 0)
+    face[mp] = 0; denom[mp] = ax[mp]
+    face[mn] = 1; denom[mn] = ax[mn]
+
+    # Y axis -> top / bottom
+    m = axis_idx == 1
+    mp = m & (y > 0); mn = m & (y <= 0)
+    face[mp] = 4; denom[mp] = ay[mp]
+    face[mn] = 5; denom[mn] = ay[mn]
+
+    # Z axis -> front / back
+    m = axis_idx == 2
+    mp = m & (z > 0); mn = m & (z <= 0)
+    face[mp] = 2; denom[mp] = az[mp]
+    face[mn] = 3; denom[mn] = az[mn]
+
+    return face, denom
+
+def _uv_on_face(face, x, y, z, denom):
+    """Compute (u,v) in [-1,1] on each cube face for directions (x,y,z)."""
+    u = np.empty_like(x)
+    v = np.empty_like(x)
+
+    # +X (right): u = -z/|x|, v =  y/|x|
+    m = (face == 0)
+    u[m] = -z[m] / denom[m]
+    v[m] =  y[m] / denom[m]
+
+    # -X (left):  u =  z/|x|, v =  y/|x|
+    m = (face == 1)
+    u[m] =  z[m] / denom[m]
+    v[m] =  y[m] / denom[m]
+
+    # +Z (front): u =  x/|z|, v =  y/|z|
+    m = (face == 2)
+    u[m] =  x[m] / denom[m]
+    v[m] =  y[m] / denom[m]
+
+    # -Z (back):  u = -x/|z|, v =  y/|z|
+    m = (face == 3)
+    u[m] = -x[m] / denom[m]
+    v[m] =  y[m] / denom[m]
+
+    # +Y (top):   u =  x/|y|, v = -z/|y|
+    m = (face == 4)
+    u[m] =  x[m] / denom[m]
+    v[m] = -z[m] / denom[m]
+
+    # -Y (bottom): u =  x/|y|, v =  z/|y|
+    m = (face == 5)
+    u[m] =  x[m] / denom[m]
+    v[m] =  z[m] / denom[m]
+
+    return u, v
+
+def _tile_offsets_for_faces(face, F):
+    idx_to_name = {0:"right",1:"left",2:"front",3:"back",4:"top",5:"bottom"}
+    cols = np.zeros_like(face, dtype=np.int32)
+    rows = np.zeros_like(face, dtype=np.int32)
+    for idx, name in idx_to_name.items():
+        m = (face == idx)
+        cx, cy = CROSS_POS[name]
+        cols[m], rows[m] = cx, cy
+    return cols * F, rows * F
+
+def _bilinear_sample(img, xf, yf):
+    H, W = img.shape[:2]
+    x0 = np.floor(xf).astype(np.int32); y0 = np.floor(yf).astype(np.int32)
+    # Clamp the base index as well to keep it in-bounds
+    x0 = np.clip(x0, 0, W - 1);        y0 = np.clip(y0, 0, H - 1)
+    x1 = np.clip(x0 + 1, 0, W - 1);    y1 = np.clip(y0 + 1, 0, H - 1)
+    wx = xf - x0; wy = yf - y0
+    Ia = img[y0, x0]; Ib = img[y0, x1]; Ic = img[y1, x0]; Id = img[y1, x1]
+    wa = (1 - wx) * (1 - wy); wb = wx * (1 - wy); wc = (1 - wx) * wy; wd = wx * wy
+    if img.ndim == 3:
+        wa = wa[..., None]; wb = wb[..., None]; wc = wc[..., None]; wd = wd[..., None]
+    return Ia * wa + Ib * wb + Ic * wc + Id * wd
+
+
+# ---------- equirect from cross ----------
+
+def _equirect_from_cross_blended(cross_f, F, eq_w, eq_h):
+    """
+    Seam-blended sampling for the equirect output. We pick the major cube face
+    for each direction, and softly cross-fade with the second-closest face
+    near edges to hide visible seams from imperfect cubemaps.
+    """
+    # Build lon/lat grid (pixel centers)
+    jj = (np.arange(eq_w, dtype=np.float64) + 0.5) / eq_w
+    ii = (np.arange(eq_h, dtype=np.float64) + 0.5) / eq_h
+    uu, vv = np.meshgrid(jj, ii)
+
+    lon = (uu * 2.0 * math.pi) - math.pi       # [-pi, pi], 0 faces +Z (front)
+    lat = (0.5 - vv) * math.pi                 # [-pi/2, pi/2], + up
+
+    cos_lat = np.cos(lat)
+    x = cos_lat * np.sin(lon)
+    y = np.sin(lat)
+    z = cos_lat * np.cos(lon)
+
+    # Magnitudes for each axis
+    ax, ay, az = np.abs(x), np.abs(y), np.abs(z)
+    axes = np.stack([ax, ay, az], axis=-1)   # (..., 3)
+
+    # Find the strongest and second-strongest axes
+    idx_sorted = np.argsort(axes, axis=-1)   # ascending
+    major_axis = idx_sorted[..., 2]
+    second_axis = idx_sorted[..., 1]
+
+    # Primary and secondary faces + their denoms
+    faces0, denom0 = _faces_from_axis_choice(major_axis, x, y, z, ax, ay, az)
+    faces1, denom1 = _faces_from_axis_choice(second_axis, x, y, z, ax, ay, az)
+
+    # (u,v) on each face, clamp to [-1,1] just in case
+    u0, v0 = _uv_on_face(faces0, x, y, z, denom0)
+    u1, v1 = _uv_on_face(faces1, x, y, z, denom1)
+    u0 = np.clip(u0, -1.0, 1.0); v0 = np.clip(v0, -1.0, 1.0)
+    u1 = np.clip(u1, -1.0, 1.0); v1 = np.clip(v1, -1.0, 1.0)
+
+    # Map [-1,1] -> pixel coords inside each face
+    fx0 = (u0 + 1.0) * 0.5 * (F - 1)
+    fy0 = (1.0 - (v0 + 1.0) * 0.5) * (F - 1)
+    fx1 = (u1 + 1.0) * 0.5 * (F - 1)
+    fy1 = (1.0 - (v1 + 1.0) * 0.5) * (F - 1)
+
+    # Add tile offsets for each face
+    offx0, offy0 = _tile_offsets_for_faces(faces0, F)
+    offx1, offy1 = _tile_offsets_for_faces(faces1, F)
+    sx0 = offx0.astype(np.float64) + fx0
+    sy0 = offy0.astype(np.float64) + fy0
+    sx1 = offx1.astype(np.float64) + fx1
+    sy1 = offy1.astype(np.float64) + fy1
+
+    # Sample both faces
+    c0 = _bilinear_sample(cross_f, sx0, sy0)
+    c1 = _bilinear_sample(cross_f, sx1, sy1)
+
+    # How close are we to an edge?  a1/a0 is near 1.0 on seams, near 0 in the center.
+    a0 = np.take_along_axis(axes, major_axis[..., None], axis=-1)[..., 0]
+    a1 = np.take_along_axis(axes, second_axis[..., None], axis=-1)[..., 0]
+    ratio = a1 / (a0 + 1e-6)
+
+    # Turn ratio into a blend weight in [0,1]
+    t = (ratio - EDGE_BLEND_START) / max(1e-6, (EDGE_BLEND_END - EDGE_BLEND_START))
+    t = np.clip(t, 0.0, 1.0) * EDGE_BLEND_STRENGTH
+    if c0.ndim == 3:
+        t = t[..., None]
+
+    return c0 * (1.0 - t) + c1 * t
+
+def equirect_from_cross(cross_img, eq_w=None, eq_h=None):
+    """
+    Generate an equirectangular panorama from a horizontal-cross cubemap image.
+    The cross must be 4*F by 3*F where F is face size.
+    If eq_w/eq_h are None, uses eq_w=4F, eq_h=2F.
+
+    If EDGE_BLEND_ENABLE is True, we do a soft cross-fade between cube faces
+    near the seams to hide cubemap discontinuities.
+    """
+    H, W = cross_img.shape[:2]
+    F = min(W // 4, H // 3)
+    if (W != 4 * F) or (H != 3 * F):
+        raise ValueError(f"Cross image has unexpected size {W}x{H}. Expected 4F x 3F.")
+
+    if eq_w is None: eq_w = 4 * F
+    if eq_h is None: eq_h = 2 * F
+
+    # Normalize source for sampling: uint8 -> float in 0..1
+    if np.issubdtype(cross_img.dtype, np.integer):
+        cross_f = cross_img.astype(np.float32) / 255.0
+    else:
+        cross_f = cross_img.astype(np.float32)
+
+    if EDGE_BLEND_ENABLE:
+        return _equirect_from_cross_blended(cross_f, F, eq_w, eq_h)
+
+    # --- Original single-face sampling path (no seam blur) ---
+    jj = (np.arange(eq_w, dtype=np.float64) + 0.5) / eq_w
+    ii = (np.arange(eq_h, dtype=np.float64) + 0.5) / eq_h
+    uu, vv = np.meshgrid(jj, ii)
+
+    lon = (uu * 2.0 * math.pi) - math.pi       # [-pi, pi]
+    lat = (0.5 - vv) * math.pi                 # [-pi/2, pi/2]
+
+    cos_lat = np.cos(lat)
+    x = cos_lat * np.sin(lon)
+    y = np.sin(lat)
+    z = cos_lat * np.cos(lon)
+
+    face_idx, denom = _face_from_dir(x, y, z)
+    u, v = _uv_on_face(face_idx, x, y, z, denom)   # [-1,1], v up in face space
+
+    fx = (u + 1.0) * 0.5 * (F - 1)
+    fy = (1.0 - (v + 1.0) * 0.5) * (F - 1)         # flip to image-down
+
+    offx, offy = _tile_offsets_for_faces(face_idx, F)
+    sx = offx.astype(np.float64) + fx
+    sy = offy.astype(np.float64) + fy
+
+    return _bilinear_sample(cross_f, sx, sy)
+
+
+# ---------- main ----------
+
+def main():
+    p = argparse.ArgumentParser(description="Build cross + equirect (default outputs both).")
+    p.add_argument("--folder","-f", default=".")
+    p.add_argument("--out","-o", default="cubemap_cross")
+    p.add_argument("--ext", default=None)
+    p.add_argument("--no-equirect", action="store_true")
+    p.add_argument("--eq-out", default="equirect")
+    p.add_argument("--eq-ext", default=None)
+    p.add_argument("--eq-width", type=int, default=None)
+    args = p.parse_args()
+
+    folder = os.path.abspath(args.folder)
+    if not os.path.isdir(folder):
+        print(f"Folder not found: {folder}", file=sys.stderr); sys.exit(1)
+
+    face_files, common_ext = find_face_files(folder)
+    out_ext = args.ext if args.ext else common_ext
+
+    # Load faces
+    imgs = {}
+    for name in FACE_BASENAMES:
+        path = os.path.join(folder, face_files[name])
+        imgs[name] = read_image(path)
+
+    # Validate
+    sizes = {(im.shape[0], im.shape[1]) for im in imgs.values()}
+    if len(sizes) != 1:
+        raise ValueError(f"All faces must be same size. Got: {sizes}")
+    h, w = next(iter(sizes))
+    if h != w:
+        raise ValueError(f"Faces must be square. Got {w}x{h}.")
+    front = imgs["front"]
+    ch = front.shape[2] if front.ndim == 3 else 1
+    dtype = front.dtype
+
+    # Build cross
+    canvas_h, canvas_w = 3*h, 4*w
+    cross = np.zeros((canvas_h, canvas_w, ch), dtype=dtype)
+    for key in ["top","left","front","right","back","bottom"]:
+        cx, cy = CROSS_POS[key]; x0, y0 = cx*w, cy*h
+        cross[y0:y0+h, x0:x0+w, ...] = imgs[key]
+
+    out_path = os.path.join(folder, args.out + out_ext)
+    write_image(out_path, cross)
+    print(f"Saved cross cubemap: {out_path}")
+    print(f"Face size: {w}x{h} | Cross size: {canvas_w}x{canvas_h}")
+
+    # Equirect (default on)
+    if not args.no_equirect:
+        target_w = args.eq_width if args.eq_width is not None else 4*w
+        target_h = max(1, target_w // 2)
+        eq = equirect_from_cross(cross, eq_w=target_w, eq_h=target_h)
+        eq_ext = args.eq_ext if args.eq_ext else out_ext
+        eq_path = os.path.join(folder, args.eq_out + eq_ext)
+        write_image(eq_path, eq)
+        print(f"Saved equirectangular pano: {eq_path}")
+        print(f"Equirect size: {target_w}x{target_h}")
+
+if __name__ == "__main__":
+    main()
+'''
+
+def run_stitcher_via_tempfile():
+    if not RUN_STITCHER:
+        dbg("RUN_STITCHER=False, skipping stitcher.")
+        return
+
+    # Choose Python:
+    # - Default: whatever Blender reports as sys.executable
+    # - Optional override: set PYTHON_EXE_OVERRIDE to a different interpreter
+    python_exe = PYTHON_EXE_OVERRIDE or sys.executable
+
+    dbg(f"Using Python interpreter: {python_exe}")
+
+    # Write the embedded stitcher to a temp file OUTSIDE the photo/cubemap folder
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", delete=False, suffix="_make_cross_cubemap.py"
+    )
+    try:
+        tmp.write(STITCHER_SOURCE)
+        tmp.flush()
+        tmp_path = tmp.name
+    finally:
+        tmp.close()
+
+    dbg(f"Temp stitcher script path: {tmp_path}")
+
+    cmd = [python_exe, tmp_path]
+    dbg("Running stitcher with cmd: " + " ".join(cmd))
+
+    try:
+        # cwd=abs_out makes it behave exactly like
+        #   cd /cubemap && python make_cross_cubemap.py
+        result = subprocess.run(
+            cmd,
+            cwd=abs_out,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        if result.stdout:
+            print(result.stdout, end="")
+        if result.stderr:
+            print(result.stderr, file=sys.stderr, end="")
+
+        dbg("Stitcher completed successfully.")
+    except subprocess.CalledProcessError as e:
+        print(f"[CMDBG] Stitcher failed with exit code {e.returncode}", file=sys.stderr)
+        if e.stdout:
+            print(e.stdout, file=sys.stderr)
+        if e.stderr:
+            print(e.stderr, file=sys.stderr)
+    finally:
+        # Clean up the temp script so nothing is left lying around
+        try:
+            os.remove(tmp_path)
+            dbg(f"Removed temp stitcher script: {tmp_path}")
+        except Exception as e:
+            dbg(f"Could not remove temp stitcher script: {e}")
+
+
+# Run the stitcher after rendering
+run_stitcher_via_tempfile()
