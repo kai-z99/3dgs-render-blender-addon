@@ -48,7 +48,7 @@ os.makedirs(abs_out, exist_ok=True)
 # Scene/render setup
 scene = bpy.context.scene
 
-# Ensure a camera exists (prefer the active scene camera), keep its CURRENT LOCATION
+# Ensure a camera exists 
 cam = scene.camera if scene.camera and scene.camera.type == 'CAMERA' else None
 if cam is None:
     for obj in bpy.data.objects:
@@ -63,9 +63,10 @@ if cam is None:
 else:
     dbg(f"Using existing camera at location: {tuple(cam.location)}")
 
+# Do NOT move the camera; use its current location
 scene.camera = cam
 
-# Configure as panoramic equirectangular
+# Configure as panoramic equirectangular (Cycles only)
 cam.data.type = 'PANO'
 cam.data.panorama_type = 'EQUIRECTANGULAR'
 
@@ -141,29 +142,80 @@ for _pat in _glob.glob(os.path.join(abs_out, "strip_*")):
             dbg(f"Could not delete old strip {_pat}: {e}")
 if _prev_deleted:
     dbg(f"Pre-clean: removed {_prev_deleted} old strip file(s).")
+    
+cam.rotation_euler[0] = math.radians(90.0)
+cam.rotation_euler[1] = math.radians(0.0)
+cam.rotation_euler[2] = math.radians(0.0)
 
-# Render N strips
+# No render border; we won't crop at all
+scene.render.use_border = False
+scene.render.use_crop_to_border = False
+
+# Make sure we are using Cycles + Equirectangular
+cam.data.type = 'PANO'
+if hasattr(cam.data, "panorama_type"):
+    cam.data.panorama_type = 'EQUIRECTANGULAR'
+if hasattr(cam.data, "cycles") and hasattr(cam.data.cycles, "panorama_type"):
+    cam.data.cycles.panorama_type = 'EQUIRECTANGULAR'
+
+# Helper: set the equirectangular longitude/latitude window (in degrees)
+def set_longlat_window(lon_min_deg: float, lon_max_deg: float, lat_min_deg: float = -90.0, lat_max_deg: float = 90.0):
+    target = getattr(cam.data, "cycles", cam.data)
+    def _set(name, deg):
+        if hasattr(target, name):
+            setattr(target, name, math.radians(deg))
+            return True
+        if hasattr(cam.data, name):
+            setattr(cam.data, name, math.radians(deg))
+            return True
+        return False
+
+    ok = True
+    ok &= _set("longitude_min", lon_min_deg)
+    ok &= _set("longitude_max", lon_max_deg)
+    ok &= _set("latitude_min",  lat_min_deg)
+    ok &= _set("latitude_max",  lat_max_deg)
+    if not ok:
+        raise RuntimeError("Panoramic longitude/latitude limits not found on this Blender build. "
+                           "Use Blender/Cycles versions that expose equirectangular windowing.")
+
+
+# Render N strips using equirectangular long/lat windowing (no border crop, no camera rotation)
+lon_step = 360.0 / NUM_STRIPS
+
 for i in range(NUM_STRIPS):
-    # Rotate Z by i * 360/N; render the leftmost band with exact pixel width
-    set_yaw_deg(i * (360.0 / NUM_STRIPS))
+    # Keep the strip ORDER compatible with your stitcher (which reverse-sorts filenames).
+    # That stitcher expects strip_{N-1} to be the LEFTMOST slice and strip_000 the RIGHTMOST.
+    # So we generate windows from RIGHT -> LEFT here.
+    lon_start = 360.0 - (i + 1) * lon_step
+    lon_end   = 360.0 -  i       * lon_step
+
+    # Full vertical FOV for every strip (capture the whole scene vertically)
+    lat_min, lat_max = -90.0, 90.0
+
+    # Apply the window
+    set_longlat_window(lon_start, lon_end, lat_min, lat_max)
+
+    # Match exact per-strip pixel width so widths sum to BASE_W (2*HEIGHT)
     w_px = widths_px[i]
-    min_x = 0.0
-    max_x = w_px / BASE_W
-    set_border(min_x, max_x)
+    scene.render.resolution_x = w_px
+    scene.render.resolution_y = HEIGHT
 
     base_name = f"strip_{i:03d}"
     scene.render.filepath = OUTPUT_DIR + base_name
     bpy.ops.render.render(write_still=True)         # BASIC RENDER
     #bpy.ops.sna.dgs_render_advanced_render_ba196() # KIRI RENDER
-    out_path = os.path.join(abs_out, base_name + EXT)
 
+    out_path = os.path.join(abs_out, base_name + EXT)
     size = -1
     try:
         size = os.path.getsize(out_path)
     except Exception:
         pass
     if PRINT_SAVE_CHECKS:
-        dbg(f"Rendered {base_name} -> {bpy.path.abspath(out_path)} (bytes={size})")
+        dbg(f"Rendered {base_name} (lon [{lon_start:.3f},{lon_end:.3f}] deg) -> {bpy.path.abspath(out_path)} (bytes={size})")
+
+
 
 print("Equirectangular strips written to:", abs_out)
 dbg("DONE.")
@@ -171,7 +223,7 @@ dbg("DONE.")
 # =========================
 # ===== Stitch Phase  =====
 # =========================
-# To preserve the exact logic of the standalone stitching script,
+# To preserve the exact logic of the standalone stitching script without modification,
 # ill write its original source to a temporary Python file and invoke it as a
 # subprocess using Blender's bundled Python. This avoids any changes to argparse
 # behavior or runtime flow in the stitcher itself.
@@ -205,12 +257,15 @@ def _ensure_packages(pkgs, target_dir):
     if not need:
         return env  # everything already available
 
+    # Make sure pip exists
     subprocess.run([sys.executable, "-m", "ensurepip", "--upgrade"], check=False)
     subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"], check=False)
 
+    # 1) Try user site 
     for imp, name in need:
         subprocess.run([sys.executable, "-m", "pip", "install", "--user", name], check=False)
 
+    # Re-check which still missing
     still = []
     for imp, name in need:
         if not _has_module(imp):
@@ -219,6 +274,7 @@ def _ensure_packages(pkgs, target_dir):
     if not still:
         return env
 
+    # 2) Fallback to project-local target
     os.makedirs(target_dir, exist_ok=True)
     for imp, name in still:
         subprocess.run(
@@ -226,13 +282,15 @@ def _ensure_packages(pkgs, target_dir):
             check=False
         )
 
+    # Make sure the parent can import from target_dir now
     if target_dir not in sys.path:
         sys.path.insert(0, target_dir)
 
+    # Ensure the child process (stitcher) can also see target_dir
     env["PYTHONPATH"] = target_dir + (os.pathsep + env.get("PYTHONPATH", "") if env.get("PYTHONPATH") else "")
     return env
 
-# Ensure the packages based on render format (keeping your functionality)
+# Ensure the packages based on render format
 pydeps_dir = os.path.join(abs_out, "_pydeps")
 child_env = _ensure_packages([
     ("PIL", "Pillow"),     # for PNG/JPG/TIFF/TGA
@@ -245,7 +303,7 @@ STITCHER_CODE = r'''#!/usr/bin/env python3
 import os, re, sys, argparse
 import numpy as np
 
-# Try imageio for HDR/EXR; Pillow for the rest
+# Try imageio for HDR/EXR, Pillow for the rest
 try:
     import imageio.v3 as iio
 except Exception:
@@ -362,11 +420,11 @@ def main():
     imgs = [_read(p) for p in paths]
     imgs = _unify_dtype_and_channels(imgs)
 
-    # Equalize height to the smallest
+    # Equalize height to the smallest 
     min_h = min(im.shape[0] for im in imgs)
     imgs = [im[:min_h, :im.shape[1], ...] for im in imgs]
 
-    # Concatenate left→right in numeric order
+    # Concatenate left -> right in numeric order
     ch = imgs[0].shape[2] if imgs[0].ndim == 3 else 1
     total_w = sum(im.shape[1] for im in imgs)
     dtype = imgs[0].dtype
@@ -377,7 +435,7 @@ def main():
         pano[:, x:x+w, ...] = im
         x += w
 
-    # Choose extension (default to first strip's)
+    # Choose extension
     in_ext = os.path.splitext(paths[0])[1]
     out_ext = args.ext if args.ext else in_ext
     if not out_ext.startswith('.'):
@@ -403,10 +461,8 @@ with tempfile.NamedTemporaryFile('w', delete=False, suffix='_stitch_eq_strips.py
 cmd = [sys.executable, stitcher_path, '--folder', abs_out, '--prefix', 'strip_', '--expected', str(NUM_STRIPS)]
 print('[EQSTRIP] Running stitcher:', ' '.join(cmd))
 try:
-    # Let the stitcher print its own progress/errors; do not alter its logic
     result = subprocess.run(cmd, check=False, env=child_env)
 finally:
-    # Optional cleanup: comment out the next line if you want to keep the temp stitcher file
     try:
         os.remove(stitcher_path)
     except Exception:
@@ -432,3 +488,6 @@ else:
         dbg("Stitcher failed; keeping strips for debugging.")
     elif KEEP_STRIPS:
         dbg("KEEP_STRIPS is True; keeping intermediate strips.")
+
+
+

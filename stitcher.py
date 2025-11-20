@@ -33,26 +33,62 @@ CROSS_POS = {
     "bottom": (1, 2),
 }
 
-def find_common_extension(folder: str) -> str:
-    found = None
-    for ext in SUPPORTED_EXTS:
-        if all(os.path.exists(os.path.join(folder, f + ext)) for f in FACE_BASENAMES):
-            found = ext; break
-    if not found:
-        names = {n.lower(): n for n in os.listdir(folder)}
-        for ext in SUPPORTED_EXTS:
-            if all((f + ext) in names for f in FACE_BASENAMES):
-                found = ext; break
-    if not found:
-        missing = []
-        for f in FACE_BASENAMES:
-            present = [e for e in SUPPORTED_EXTS if os.path.exists(os.path.join(folder, f + e))]
-            if not present: missing.append(f)
-        msg = "Could not find all six faces with a single shared extension.\n"
-        if missing: msg += "Missing (any ext): " + ", ".join(missing) + "\n"
-        msg += "Expected: right.png left.png front.png back.png top.png bottom.png"
-        raise FileNotFoundError(msg)
-    return found
+
+# ---------- file discovery (supports prefixes like right0001_color.png) ----------
+
+def find_face_files(folder: str):
+    """
+    Find one file for each cubemap face in `folder`, where the filename
+    (without path) starts with the face name (right/left/front/back/top/bottom),
+    case-insensitive, and uses a supported extension.
+
+    Returns:
+        face_files: dict[face] = filename (basename only)
+        common_ext: extension string like ".png"
+
+    Raises:
+        FileNotFoundError if any face is missing or faces don't share an ext.
+    """
+    all_files = [f for f in os.listdir(folder)
+                 if os.path.isfile(os.path.join(folder, f))]
+    if not all_files:
+        raise FileNotFoundError(f"No files found in folder: {folder}")
+
+    face_files = {}
+    exts = set()
+
+    for face in FACE_BASENAMES:
+        prefix = face.lower()
+        candidates = []
+        for fname in all_files:
+            low = fname.lower()
+            base, ext = os.path.splitext(low)
+            if not ext or ext not in SUPPORTED_EXTS:
+                continue
+            if base.startswith(prefix):
+                candidates.append(fname)
+
+        if not candidates:
+            raise FileNotFoundError(
+                f"Could not find any file starting with '{face}' "
+                f"and with a supported extension in {folder}"
+            )
+
+        # Pick a deterministic candidate (shortest name, then lexicographically)
+        candidates.sort(key=lambda s: (len(s), s.lower()))
+        chosen = candidates[0]
+        face_files[face] = chosen
+        exts.add(os.path.splitext(chosen)[1].lower())
+
+    if len(exts) != 1:
+        raise FileNotFoundError(
+            "All six faces must share a single extension. Found: "
+            + ", ".join(sorted(exts))
+        )
+
+    common_ext = next(iter(exts))
+    return face_files, common_ext
+
 
 def read_image(path: str):
     ext = os.path.splitext(path)[1].lower()
@@ -77,15 +113,9 @@ def np_from_pillow(im):
 def write_image(path: str, arr):
     ext = os.path.splitext(path)[1].lower()
 
-        # If writing Radiance HDR, drop alpha if present (HDR is RGB)
+    # If writing Radiance HDR, drop alpha if present (HDR is RGB)
     if ext == ".hdr" and arr.ndim == 3 and arr.shape[-1] == 4:
         arr = arr[..., :3]
-
-    if ext in [".hdr", ".exr"]:
-        if iio is None:
-            raise RuntimeError("Writing HDR/EXR requires `imageio` (pip install imageio).")
-        iio.imwrite(path, arr.astype(np.float32))
-        return
 
     # HDR/EXR via imageio (write floats as-is)
     if ext in [".hdr", ".exr"]:
@@ -117,7 +147,7 @@ def write_image(path: str, arr):
     Image.fromarray(a).save(path)
 
 
-# ---------- equirect from cross ----------
+# ---------- equirect from cross (unchanged) ----------
 
 def _face_from_dir(x, y, z):
     ax, ay, az = np.abs(x), np.abs(y), np.abs(z)
@@ -209,7 +239,6 @@ def equirect_from_cross(cross_img, eq_w=None, eq_h=None):
     if eq_h is None: eq_h = 2 * F
 
     # --- Normalize source for sampling ---
-    # If the cross is uint8, convert to float in 0..1 for correct filtering.
     if np.issubdtype(cross_img.dtype, np.integer):
         cross_f = cross_img.astype(np.float32) / 255.0
     else:
@@ -260,18 +289,25 @@ def main():
     if not os.path.isdir(folder):
         print(f"Folder not found: {folder}", file=sys.stderr); sys.exit(1)
 
-    common_ext = find_common_extension(folder)
+    face_files, common_ext = find_face_files(folder)
     out_ext = args.ext if args.ext else common_ext
 
     # Load faces
-    imgs = {name: read_image(os.path.join(folder, name + common_ext)) for name in FACE_BASENAMES}
+    imgs = {}
+    for name in FACE_BASENAMES:
+        path = os.path.join(folder, face_files[name])
+        imgs[name] = read_image(path)
 
     # Validate
     sizes = {(im.shape[0], im.shape[1]) for im in imgs.values()}
-    if len(sizes) != 1: raise ValueError(f"All faces must be same size. Got: {sizes}")
+    if len(sizes) != 1:
+        raise ValueError(f"All faces must be same size. Got: {sizes}")
     h, w = next(iter(sizes))
-    if h != w: raise ValueError(f"Faces must be square. Got {w}x{h}.")
-    front = imgs["front"]; ch = front.shape[2] if front.ndim == 3 else 1; dtype = front.dtype
+    if h != w:
+        raise ValueError(f"Faces must be square. Got {w}x{h}.")
+    front = imgs["front"]
+    ch = front.shape[2] if front.ndim == 3 else 1
+    dtype = front.dtype
 
     # Build cross
     canvas_h, canvas_w = 3*h, 4*w

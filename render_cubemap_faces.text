@@ -61,7 +61,8 @@ if ATOMIC_MOVES:
 dbg(f"START | RES={RES} ENGINE={ENGINE} FILE_FMT={FILE_FMT} VIEW={VIEW_TRANSFORM} OUT={abs_out}")
 dbg(f"HDRLIKE={IS_HDRLIKE} EXR={IS_EXR} RAD_HDR={IS_RAD_HDR} COLORSPACE={COLORSPACE} EXT={EXT}")
 
-# Ensure a camera exists, or create one at 3D cursor
+# Ensure a camera exists, or create one
+created_cam = False
 cam = None
 for obj in bpy.data.objects:
     if obj.type == 'CAMERA':
@@ -71,13 +72,17 @@ if cam is None:
     cam_data = bpy.data.cameras.new("CubemapCam")
     cam = bpy.data.objects.new("CubemapCam", cam_data)
     bpy.context.collection.objects.link(cam)
+    created_cam = True
     dbg("Created camera: CubemapCam")
 
-# Move camera to 3D cursor + small Z offset
-cursor = bpy.context.scene.cursor.location
-cam.location = Vector((cursor.x, cursor.y, cursor.z + 2.0))
-cam.rotation_euler = (0.0, 0.0, 0.0)
-dbg(f"Camera at {tuple(cam.location)}")
+# If we created the camera, place it at the 3D cursor.
+# If we found an existing camera, KEEP its current position.
+if created_cam:
+    cursor = bpy.context.scene.cursor.location
+    cam.location = Vector((cursor.x, cursor.y, cursor.z + 2.0))
+    dbg(f"New camera at {tuple(cam.location)}")
+else:
+    dbg(f"Using existing camera position at {tuple(cam.location)}")
 
 # Camera lens: 90° FOV for cube faces
 cam.data.lens_unit = 'FOV'
@@ -134,14 +139,15 @@ def render_face(name, yaw_z, pitch_x):
     if ATOMIC_MOVES:
         tmp_base = os.path.join(tmp_dir, name)
         scene.render.filepath = bpy.path.relpath(tmp_base)
-        bpy.ops.render.render(write_still=True)
+        # bpy.ops.render.render(write_still=True)
+        bpy.ops.sna.dgs_render_advanced_render_ba196()
         src = os.path.join(tmp_dir, name + EXT)
         dst = os.path.join(abs_out, name + EXT)
         os.replace(src, dst)
         return dst
     else:
         scene.render.filepath = OUTPUT_DIR + name  # Blender appends extension
-        #bpy.ops.render.render(write_still=True)
+        # bpy.ops.render.render(write_still=True)
         bpy.ops.sna.dgs_render_advanced_render_ba196()
         return os.path.join(abs_out, name + EXT)
 
